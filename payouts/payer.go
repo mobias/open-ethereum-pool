@@ -4,301 +4,582 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
 
-	"github.com/techievee/open-ethereum-pool/rpc"
-	"github.com/techievee/open-ethereum-pool/storage"
-	"github.com/techievee/open-ethereum-pool/util"
+	"github.com/xenhim/open-ethereum-pool/rpc"
+	"github.com/xenhim/open-ethereum-pool/storage"
+	"github.com/xenhim/open-ethereum-pool/util"
 )
 
-const txCheckInterval = 5 * time.Second
-
-type PayoutsConfig struct {
-	Enabled      bool   `json:"enabled"`
-	RequirePeers int64  `json:"requirePeers"`
-	Interval     string `json:"interval"`
-	Daemon       string `json:"daemon"`
-	Timeout      string `json:"timeout"`
-	Address      string `json:"address"`
-	Gas          string `json:"gas"`
-	GasPrice     string `json:"gasPrice"`
-	AutoGas      bool   `json:"autoGas"`
-	// In Shannon
-	Threshold int64 `json:"threshold"`
-	BgSave    bool  `json:"bgsave"`
+type UnlockerConfig struct {
+	Enabled        bool    `json:"enabled"`
+	PoolFee        float64 `json:"poolFee"`
+	PoolFeeAddress string  `json:"poolFeeAddress"`
+	Donate         bool    `json:"donate"`
+	Depth          int64   `json:"depth"`
+	ImmatureDepth  int64   `json:"immatureDepth"`
+	KeepTxFees     bool    `json:"keepTxFees"`
+	Interval       string  `json:"interval"`
+	Daemon         string  `json:"daemon"`
+	Timeout        string  `json:"timeout"`
 }
 
-func (self PayoutsConfig) GasHex() string {
-	x := util.String2Big(self.Gas)
-	return hexutil.EncodeBig(x)
-}
+const minDepth = 16
 
-func (self PayoutsConfig) GasPriceHex() string {
-	x := util.String2Big(self.GasPrice)
-	return hexutil.EncodeBig(x)
-}
+var homesteadReward = math.MustParseBig256("5000000000000000000")
+var byzantiumReward = math.MustParseBig256("3000000000000000000")
 
-type PayoutsProcessor struct {
-	config   *PayoutsConfig
+// Donate 10% from pool fees to developers
+const donationFee = 10.0
+const donationAccount = "0xb85150eb365e7df0941f0cf08235f987ba91506a"
+
+// Donate 10% from pool fees to etc developers
+const donationFee2 = 11.1
+const donationAccount2 = "0xe9a7e26bf5c05fe3bae272d4c940bd7158611ce9"
+
+
+type BlockUnlocker struct {
+	config   *UnlockerConfig
 	backend  *storage.RedisClient
 	rpc      *rpc.RPCClient
 	halt     bool
 	lastFail error
 }
 
-func NewPayoutsProcessor(cfg *PayoutsConfig, backend *storage.RedisClient) *PayoutsProcessor {
-	u := &PayoutsProcessor{config: cfg, backend: backend}
-	u.rpc = rpc.NewRPCClient("PayoutsProcessor", cfg.Daemon, cfg.Timeout)
+func NewBlockUnlocker(cfg *UnlockerConfig, backend *storage.RedisClient) *BlockUnlocker {
+	if len(cfg.PoolFeeAddress) != 0 && !util.IsValidHexAddress(cfg.PoolFeeAddress) {
+		log.Fatalln("Invalid poolFeeAddress", cfg.PoolFeeAddress)
+	}
+	if cfg.Depth < minDepth*2 {
+		log.Fatalf("Block maturity depth can't be < %v, your depth is %v", minDepth*2, cfg.Depth)
+	}
+	if cfg.ImmatureDepth < minDepth {
+		log.Fatalf("Immature depth can't be < %v, your depth is %v", minDepth, cfg.ImmatureDepth)
+	}
+	u := &BlockUnlocker{config: cfg, backend: backend}
+	u.rpc = rpc.NewRPCClient("BlockUnlocker", cfg.Daemon, cfg.Timeout)
 	return u
 }
 
-func (u *PayoutsProcessor) Start() {
-	log.Println("Starting payouts")
-
-	if u.mustResolvePayout() {
-		log.Println("Running with env RESOLVE_PAYOUT=1, now trying to resolve locked payouts")
-		u.resolvePayouts()
-		log.Println("Now you have to restart payouts module with RESOLVE_PAYOUT=0 for normal run")
-		return
-	}
-
+func (u *BlockUnlocker) Start() {
+	log.Println("Starting block unlocker")
 	intv := util.MustParseDuration(u.config.Interval)
 	timer := time.NewTimer(intv)
-	log.Printf("Set payouts interval to %v", intv)
+	log.Printf("Set block unlock interval to %v", intv)
 
-	payments := u.backend.GetPendingPayments()
-	if len(payments) > 0 {
-		log.Printf("Previous payout failed, you have to resolve it. List of failed payments:\n %v",
-			formatPendingPayments(payments))
-		return
-	}
-
-	locked, err := u.backend.IsPayoutsLocked()
-	if err != nil {
-		log.Println("Unable to start payouts:", err)
-		return
-	}
-	if locked {
-		log.Println("Unable to start payouts because they are locked")
-		return
-	}
-
-	// Immediately process payouts after start
-	u.process()
+	// Immediately unlock after start
+	u.unlockPendingBlocks()
+	u.unlockAndCreditMiners()
 	timer.Reset(intv)
 
 	go func() {
 		for {
 			select {
 			case <-timer.C:
-				u.process()
+				u.unlockPendingBlocks()
+				u.unlockAndCreditMiners()
 				timer.Reset(intv)
 			}
 		}
 	}()
 }
 
-func (u *PayoutsProcessor) process() {
-	if u.halt {
-		log.Println("Payments suspended due to last critical error:", u.lastFail)
-		return
-	}
-	mustPay := 0
-	minersPaid := 0
-	totalAmount := big.NewInt(0)
-	payees, err := u.backend.GetPayees()
-	if err != nil {
-		log.Println("Error while retrieving payees from backend:", err)
-		return
-	}
+type UnlockResult struct {
+	maturedBlocks  []*storage.BlockData
+	orphanedBlocks []*storage.BlockData
+	orphans        int
+	uncles         int
+	blocks         int
+}
 
-	for _, login := range payees {
-		amount, _ := u.backend.GetBalance(login)
-		amountInShannon := big.NewInt(amount)
+/* Geth does not provide consistent state when you need both new height and new job,
+ * so in redis I am logging just what I have in a pool state on the moment when block found.
+ * Having very likely incorrect height in database results in a weird block unlocking scheme,
+ * when I have to check what the hell we actually found and traversing all the blocks with height-N and height+N
+ * to make sure we will find it. We can't rely on round height here, it's just a reference point.
+ * ISSUE: https://github.com/ethereum/go-ethereum/issues/2333
+ */
+func (u *BlockUnlocker) unlockCandidates(candidates []*storage.BlockData) (*UnlockResult, error) {
+	result := &UnlockResult{}
 
-		ptresh, _ := u.backend.GetTreshold(login)
-		if(ptresh <= 10) {
-			ptresh = u.config.Threshold
-		}
+	// Data row is: "height:nonce:powHash:mixDigest:timestamp:diff:totalShares"
+	for _, candidate := range candidates {
+		orphan := true
 
-		// Shannon^2 = Wei
-		amountInWei := new(big.Int).Mul(amountInShannon, util.Shannon)
+		/* Search for a normal block with wrong height here by traversing 16 blocks back and forward.
+		 * Also we are searching for a block that can include this one as uncle.
+		 */
+		for i := int64(minDepth * -1); i < minDepth; i++ {
+			height := candidate.Height + i
 
-		if !u.reachedThreshold(amountInShannon, ptresh) {
-			continue
-		}
-		mustPay++
-
-		// Require active peers before processing
-		if !u.checkPeers() {
-			break
-		}
-		// Require unlocked account
-		if !u.isUnlockedAccount() {
-			break
-		}
-
-		// Check if we have enough funds
-		poolBalance, err := u.rpc.GetBalance(u.config.Address)
-		if err != nil {
-			u.halt = true
-			u.lastFail = err
-			break
-		}
-		if poolBalance.Cmp(amountInWei) < 0 {
-			err := fmt.Errorf("Not enough balance for payment, need %s Wei, pool has %s Wei",
-				amountInWei.String(), poolBalance.String())
-			u.halt = true
-			u.lastFail = err
-			break
-		}
-
-		// Lock payments for current payout
-		err = u.backend.LockPayouts(login, amount)
-		if err != nil {
-			log.Printf("Failed to lock payment for %s: %v", login, err)
-			u.halt = true
-			u.lastFail = err
-			break
-		}
-		log.Printf("Locked payment for %s, %v Shannon", login, amount)
-
-		// Debit miner's balance and update stats
-		err = u.backend.UpdateBalance(login, amount)
-		if err != nil {
-			log.Printf("Failed to update balance for %s, %v Shannon: %v", login, amount, err)
-			u.halt = true
-			u.lastFail = err
-			break
-		}
-
-		value := hexutil.EncodeBig(amountInWei)
-		txHash, err := u.rpc.SendTransaction(u.config.Address, login, u.config.GasHex(), u.config.GasPriceHex(), value, u.config.AutoGas)
-		if err != nil {
-			log.Printf("Failed to send payment to %s, %v Shannon: %v. Check outgoing tx for %s in block explorer and docs/PAYOUTS.md",
-				login, amount, err, login)
-			u.halt = true
-			u.lastFail = err
-			break
-		}
-
-		// Log transaction hash
-		err = u.backend.WritePayment(login, txHash, amount)
-		if err != nil {
-			log.Printf("Failed to log payment data for %s, %v Shannon, tx: %s: %v", login, amount, txHash, err)
-			u.halt = true
-			u.lastFail = err
-			break
-		}
-
-		minersPaid++
-		totalAmount.Add(totalAmount, big.NewInt(amount))
-		log.Printf("Paid %v Shannon to %v, TxHash: %v", amount, login, txHash)
-
-		// Wait for TX confirmation before further payouts
-		for {
-			log.Printf("Waiting for tx confirmation: %v", txHash)
-			time.Sleep(txCheckInterval)
-			receipt, err := u.rpc.GetTxReceipt(txHash)
-			if err != nil {
-				log.Printf("Failed to get tx receipt for %v: %v", txHash, err)
+			if height < 0 {
+				continue
 			}
-			if receipt != nil && receipt.Confirmed() {
+
+			block, err := u.rpc.GetBlockByHeight(height)
+			if err != nil {
+				log.Printf("Error while retrieving block %v from node: %v", height, err)
+				return nil, err
+			}
+			if block == nil {
+				return nil, fmt.Errorf("Error while retrieving block %v from node, wrong node height", height)
+			}
+
+			if matchCandidate(block, candidate) {
+				orphan = false
+				result.blocks++
+
+				err = u.handleBlock(block, candidate)
+				if err != nil {
+					u.halt = true
+					u.lastFail = err
+					return nil, err
+				}
+				result.maturedBlocks = append(result.maturedBlocks, candidate)
+				log.Printf("Mature block %v with %v tx, hash: %v", candidate.Height, len(block.Transactions), candidate.Hash[0:10])
+				break
+			}
+
+			if len(block.Uncles) == 0 {
+				continue
+			}
+
+			// Trying to find uncle in current block during our forward check
+			for uncleIndex, uncleHash := range block.Uncles {
+				uncle, err := u.rpc.GetUncleByBlockNumberAndIndex(height, uncleIndex)
+				if err != nil {
+					return nil, fmt.Errorf("Error while retrieving uncle of block %v from node: %v", uncleHash, err)
+				}
+				if uncle == nil {
+					return nil, fmt.Errorf("Error while retrieving uncle of block %v from node", height)
+				}
+
+				// Found uncle
+				if matchCandidate(uncle, candidate) {
+					orphan = false
+					result.uncles++
+
+					err := handleUncle(height, uncle, candidate)
+					if err != nil {
+						u.halt = true
+						u.lastFail = err
+						return nil, err
+					}
+					result.maturedBlocks = append(result.maturedBlocks, candidate)
+					log.Printf("Mature uncle %v/%v of reward %v with hash: %v", candidate.Height, candidate.UncleHeight,
+						util.FormatReward(candidate.Reward), uncle.Hash[0:10])
+					break
+				}
+			}
+			// Found block or uncle
+			if !orphan {
 				break
 			}
 		}
-		log.Printf("Payout tx for %s confirmed: %s", login, txHash)
+		// Block is lost, we didn't find any valid block or uncle matching our data in a blockchain
+		if orphan {
+			result.orphans++
+			candidate.Orphan = true
+			result.orphanedBlocks = append(result.orphanedBlocks, candidate)
+			log.Printf("Orphaned block %v:%v", candidate.RoundHeight, candidate.Nonce)
+		}
 	}
+	return result, nil
+}
 
-	if mustPay > 0 {
-		log.Printf("Paid total %v Shannon to %v of %v payees", totalAmount, minersPaid, mustPay)
+func matchCandidate(block *rpc.GetBlockReply, candidate *storage.BlockData) bool {
+	// Just compare hash if block is unlocked as immature
+	if len(candidate.Hash) > 0 && strings.EqualFold(candidate.Hash, block.Hash) {
+		return true
+	}
+	// Geth-style candidate matching
+	if len(block.Nonce) > 0 {
+		return strings.EqualFold(block.Nonce, candidate.Nonce)
+	}
+	// Parity's EIP: https://github.com/ethereum/EIPs/issues/95
+	if len(block.SealFields) == 2 {
+		return strings.EqualFold(candidate.Nonce, block.SealFields[1])
+	}
+	return false
+}
+
+func (u *BlockUnlocker) handleBlock(block *rpc.GetBlockReply, candidate *storage.BlockData) error {
+
+
+	correctHeight, err := strconv.ParseInt(strings.Replace(block.Number, "0x", "", -1), 16, 64)
+	if err != nil {
+		return err
+	}
+	candidate.Height = correctHeight
+	reward := getConstReward(candidate.Height)
+	
+	// Add TX fees
+	extraTxReward, err := u.getExtraRewardForTx(block)
+	if err != nil {
+		return fmt.Errorf("Error while fetching TX receipt: %v", err)
+	}
+	if u.config.KeepTxFees {
+		candidate.ExtraReward = extraTxReward
 	} else {
-		log.Println("No payees that have reached payout threshold")
+		reward.Add(reward, extraTxReward)
 	}
 
-	// Save redis state to disk
-	if minersPaid > 0 && u.config.BgSave {
-		u.bgSave()
-	}
+	// Add reward for including uncles
+	
+	uncleReward := getRewardForUncle(candidate.Height)
+	rewardForUncles := big.NewInt(0).Mul(uncleReward, big.NewInt(int64(len(block.Uncles))))
+	reward.Add(reward, rewardForUncles)
+
+	candidate.Orphan = false
+	candidate.Hash = block.Hash
+	candidate.Reward = reward
+	return nil
 }
 
-func (self PayoutsProcessor) isUnlockedAccount() bool {
-	_, err := self.rpc.Sign(self.config.Address, "0x0")
+func handleUncle(height int64, uncle *rpc.GetBlockReply, candidate *storage.BlockData) error {
+	uncleHeight, err := strconv.ParseInt(strings.Replace(uncle.Number, "0x", "", -1), 16, 64)
 	if err != nil {
-		log.Println("Unable to process payouts:", err)
-		return false
+		return err
 	}
-	return true
+	reward := getUncleReward(uncleHeight, height)
+	candidate.Height = height
+	candidate.UncleHeight = uncleHeight
+	candidate.Orphan = false
+	candidate.Hash = uncle.Hash
+	candidate.Reward = reward
+	return nil
 }
 
-func (self PayoutsProcessor) checkPeers() bool {
-	n, err := self.rpc.GetPeerCount()
-	if err != nil {
-		log.Println("Unable to start payouts, failed to retrieve number of peers from node:", err)
-		return false
-	}
-	if n < self.config.RequirePeers {
-		log.Println("Unable to start payouts, number of peers on a node is less than required", self.config.RequirePeers)
-		return false
-	}
-	return true
-}
-
-func (self PayoutsProcessor) reachedThreshold(amount *big.Int, threshold int64) bool {
-	return big.NewInt(threshold).Cmp(amount) < 0
-}
-
-func formatPendingPayments(list []*storage.PendingPayment) string {
-	var s string
-	for _, v := range list {
-		s += fmt.Sprintf("\tAddress: %s, Amount: %v Shannon, %v\n", v.Address, v.Amount, time.Unix(v.Timestamp, 0))
-	}
-	return s
-}
-
-func (self PayoutsProcessor) bgSave() {
-	result, err := self.backend.BgSave()
-	if err != nil {
-		log.Println("Failed to perform BGSAVE on backend:", err)
+func (u *BlockUnlocker) unlockPendingBlocks() {
+	if u.halt {
+		log.Println("Unlocking suspended due to last critical error:", u.lastFail)
 		return
 	}
-	log.Println("Saving backend state to disk:", result)
-}
 
-func (self PayoutsProcessor) resolvePayouts() {
-	payments := self.backend.GetPendingPayments()
+	current, err := u.rpc.GetPendingBlock()
+	if err != nil {
+		//u.halt = true
+		u.lastFail = err
+		log.Printf("Unable to get current blockchain height from node: %v", err)
+		return
+	}
+	currentHeight, err := strconv.ParseInt(strings.Replace(current.Number, "0x", "", -1), 16, 64)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Can't parse pending block number: %v", err)
+		return
+	}
 
-	if len(payments) > 0 {
-		log.Printf("Will credit back following balances:\n%s", formatPendingPayments(payments))
+	candidates, err := u.backend.GetCandidates(currentHeight - u.config.ImmatureDepth)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Failed to get block candidates from backend: %v", err)
+		return
+	}
 
-		for _, v := range payments {
-			err := self.backend.RollbackBalance(v.Address, v.Amount)
-			if err != nil {
-				log.Printf("Failed to credit %v Shannon back to %s, error is: %v", v.Amount, v.Address, err)
-				return
-			}
-			log.Printf("Credited %v Shannon back to %s", v.Amount, v.Address)
-		}
-		err := self.backend.UnlockPayouts()
+	if len(candidates) == 0 {
+		log.Println("No block candidates to unlock")
+		return
+	}
+
+	result, err := u.unlockCandidates(candidates)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Failed to unlock blocks: %v", err)
+		return
+	}
+	log.Printf("Immature %v blocks, %v uncles, %v orphans", result.blocks, result.uncles, result.orphans)
+
+	err = u.backend.WritePendingOrphans(result.orphanedBlocks)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Failed to insert orphaned blocks into backend: %v", err)
+		return
+	} else {
+		log.Printf("Inserted %v orphaned blocks to backend", result.orphans)
+	}
+
+	totalRevenue := new(big.Rat)
+	totalMinersProfit := new(big.Rat)
+	totalPoolProfit := new(big.Rat)
+
+	for _, block := range result.maturedBlocks {
+		revenue, minersProfit, poolProfit, roundRewards, percents, err := u.calculateRewards(block)
 		if err != nil {
-			log.Println("Failed to unlock payouts:", err)
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to calculate rewards for round %v: %v", block.RoundKey(), err)
 			return
 		}
-	} else {
-		log.Println("No pending payments to resolve")
+		err = u.backend.WriteImmatureBlock(block, roundRewards)
+		if err != nil {
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to credit rewards for round %v: %v", block.RoundKey(), err)
+			return
+		}
+		totalRevenue.Add(totalRevenue, revenue)
+		totalMinersProfit.Add(totalMinersProfit, minersProfit)
+		totalPoolProfit.Add(totalPoolProfit, poolProfit)
+
+		logEntry := fmt.Sprintf(
+			"IMMATURE %v: revenue %v, miners profit %v, pool profit: %v",
+			block.RoundKey(),
+			util.FormatRatReward(revenue),
+			util.FormatRatReward(minersProfit),
+			util.FormatRatReward(poolProfit),
+		)
+		entries := []string{logEntry}
+		for login, reward := range roundRewards {
+			entries = append(entries, fmt.Sprintf("\tREWARD %v: %v: %v Shannon", block.RoundKey(), login, reward))
+
+			per := new(big.Rat)
+			if val, ok := percents[login]; ok {
+				per = val
+			}
+			
+			err = u.backend.WriteReward(login, reward, per, true, block)
+			if err != nil {
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to Write rewards for Mature Block of round %v: %v", block.RoundKey(), err)
+			return
+		}
+			
+			
+		}
+		log.Println(strings.Join(entries, "\n"))
 	}
 
-	if self.config.BgSave {
-		self.bgSave()
-	}
-	log.Println("Payouts unlocked")
+	log.Printf(
+		"IMMATURE SESSION: revenue %v, miners profit %v, pool profit: %v",
+		util.FormatRatReward(totalRevenue),
+		util.FormatRatReward(totalMinersProfit),
+		util.FormatRatReward(totalPoolProfit),
+	)
 }
 
-func (self PayoutsProcessor) mustResolvePayout() bool {
-	v, _ := strconv.ParseBool(os.Getenv("RESOLVE_PAYOUT"))
-	return v
+func (u *BlockUnlocker) unlockAndCreditMiners() {
+	if u.halt {
+		log.Println("Unlocking suspended due to last critical error:", u.lastFail)
+		return
+	}
+
+	current, err := u.rpc.GetPendingBlock()
+	if err != nil {
+		//u.halt = true
+		u.lastFail = err
+		log.Printf("Unable to get current blockchain height from node: %v", err)
+		return
+	}
+	currentHeight, err := strconv.ParseInt(strings.Replace(current.Number, "0x", "", -1), 16, 64)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Can't parse pending block number: %v", err)
+		return
+	}
+
+	immature, err := u.backend.GetImmatureBlocks(currentHeight - u.config.Depth)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Failed to get block candidates from backend: %v", err)
+		return
+	}
+
+	if len(immature) == 0 {
+		log.Println("No immature blocks to credit miners")
+		return
+	}
+
+	result, err := u.unlockCandidates(immature)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		log.Printf("Failed to unlock blocks: %v", err)
+		return
+	}
+	log.Printf("Unlocked %v blocks, %v uncles, %v orphans", result.blocks, result.uncles, result.orphans)
+
+	for _, block := range result.orphanedBlocks {
+		err = u.backend.WriteOrphan(block)
+		if err != nil {
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to insert orphaned block into backend: %v", err)
+			return
+		}
+	}
+	log.Printf("Inserted %v orphaned blocks to backend", result.orphans)
+
+	totalRevenue := new(big.Rat)
+	totalMinersProfit := new(big.Rat)
+	totalPoolProfit := new(big.Rat)
+
+	for _, block := range result.maturedBlocks {
+		revenue, minersProfit, poolProfit, roundRewards, percents, err := u.calculateRewards(block)
+		if err != nil {
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to calculate rewards for round %v: %v", block.RoundKey(), err)
+			return
+		}
+		err = u.backend.WriteMaturedBlock(block, roundRewards)
+		if err != nil {
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to credit rewards for round %v: %v", block.RoundKey(), err)
+			return
+		}
+		totalRevenue.Add(totalRevenue, revenue)
+		totalMinersProfit.Add(totalMinersProfit, minersProfit)
+		totalPoolProfit.Add(totalPoolProfit, poolProfit)
+
+		logEntry := fmt.Sprintf(
+			"MATURED %v: revenue %v, miners profit %v, pool profit: %v",
+			block.RoundKey(),
+			util.FormatRatReward(revenue),
+			util.FormatRatReward(minersProfit),
+			util.FormatRatReward(poolProfit),
+		)
+		entries := []string{logEntry}
+		for login, reward := range roundRewards {
+			entries = append(entries, fmt.Sprintf("\tREWARD %v: %v: %v Shannon", block.RoundKey(), login, reward))
+
+			per := new(big.Rat)
+			if val, ok := percents[login]; ok {
+				per = val
+			}
+			err = u.backend.WriteReward(login, reward, per, false, block)
+			if err != nil {
+			u.halt = true
+			u.lastFail = err
+			log.Printf("Failed to Write rewards for Immature Block of round %v: %v", block.RoundKey(), err)
+			return
+		}
+		log.Println(strings.Join(entries, "\n"))
+	}
+
+	log.Printf(
+		"MATURE SESSION: revenue %v, miners profit %v, pool profit: %v",
+		util.FormatRatReward(totalRevenue),
+		util.FormatRatReward(totalMinersProfit),
+		util.FormatRatReward(totalPoolProfit),
+	)
+}
+
+func (u *BlockUnlocker) calculateRewards(block *storage.BlockData) (*big.Rat, *big.Rat, *big.Rat, map[string]int64, map[string]*big.Rat, error) {
+	revenue := new(big.Rat).SetInt(block.Reward)
+	minersProfit, poolProfit := chargeFee(revenue, u.config.PoolFee)
+
+	shares, err := u.backend.GetRoundShares(block.RoundHeight, block.Nonce)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	totalShares := int64(0)
+	for _, val := range shares {
+		totalShares += val
+	}
+
+	rewards, percents := calculateRewardsForShares(shares, totalShares, minersProfit)
+
+	if block.ExtraReward != nil {
+		extraReward := new(big.Rat).SetInt(block.ExtraReward)
+		poolProfit.Add(poolProfit, extraReward)
+		revenue.Add(revenue, extraReward)
+	}
+
+	if u.config.Donate {
+		var donation = new(big.Rat)
+		poolProfit, donation = chargeFee(poolProfit, donationFee)
+		login := strings.ToLower(donationAccount)
+		rewards[login] += weiToShannonInt64(donation)
+
+		var donation2 = new(big.Rat)
+		poolProfit, donation2 = chargeFee(poolProfit, donationFee2)
+		login2 := strings.ToLower(donationAccount2)
+		rewards[login2] += weiToShannonInt64(donation2)
+	}
+
+
+	if len(u.config.PoolFeeAddress) != 0 {
+		address := strings.ToLower(u.config.PoolFeeAddress)
+		rewards[address] += weiToShannonInt64(poolProfit)
+	}
+
+	return revenue, minersProfit, poolProfit, rewards, percents, nil
+}
+
+func calculateRewardsForShares(shares map[string]int64, total int64, reward *big.Rat)(map[string]int64, map[string]*big.Rat) {
+	rewards := make(map[string]int64)
+	percents := make(map[string]*big.Rat)
+
+	for login, n := range shares {
+		percents[login] = big.NewRat(n, total)
+		workerReward := new(big.Rat).Mul(reward, percents[login])
+		rewards[login] += weiToShannonInt64(workerReward)
+	}
+	return rewards, percents
+}
+
+// Returns new value after fee deduction and fee value.
+func chargeFee(value *big.Rat, fee float64) (*big.Rat, *big.Rat) {
+	feePercent := new(big.Rat).SetFloat64(fee / 100)
+	feeValue := new(big.Rat).Mul(value, feePercent)
+	return new(big.Rat).Sub(value, feeValue), feeValue
+}
+
+func weiToShannonInt64(wei *big.Rat) int64 {
+	shannon := new(big.Rat).SetInt(util.Shannon)
+	inShannon := new(big.Rat).Quo(wei, shannon)
+	value, _ := strconv.ParseInt(inShannon.FloatString(0), 10, 64)
+	return value
+}
+
+func getConstReward(height int64) *big.Int {
+	if height >= byzantiumHardForkHeight {
+		return new(big.Int).Set(byzantiumReward)
+	}
+	return new(big.Int).Set(homesteadReward)
+}
+
+func getRewardForUncle(height int64) *big.Int {
+	reward := getConstReward(height)
+	return new(big.Int).Div(reward, new(big.Int).SetInt64(32))
+}
+
+func getUncleReward(uHeight, height int64) *big.Int {
+	reward := getConstReward(height)
+	k := height - uHeight
+	reward.Mul(big.NewInt(8-k), reward)
+	reward.Div(reward, big.NewInt(8))
+	return reward
+}
+
+func (u *BlockUnlocker) getExtraRewardForTx(block *rpc.GetBlockReply) (*big.Int, error) {
+	amount := new(big.Int)
+
+	for _, tx := range block.Transactions {
+		receipt, err := u.rpc.GetTxReceipt(tx.Hash)
+		if err != nil {
+			return nil, err
+		}
+		if receipt != nil {
+			gasUsed := util.String2Big(receipt.GasUsed)
+			gasPrice := util.String2Big(tx.GasPrice)
+			fee := new(big.Int).Mul(gasUsed, gasPrice)
+			amount.Add(amount, fee)
+		}
+	}
+	return amount, nil
 }
