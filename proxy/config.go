@@ -1,10 +1,10 @@
 package proxy
 
 import (
-	"github.com/techievee/open-ethereum-pool/api"
-	"github.com/techievee/open-ethereum-pool/payouts"
-	"github.com/techievee/open-ethereum-pool/policy"
-	"github.com/techievee/open-ethereum-pool/storage"
+	"github.com/xenhim/open-ethereum-pool/api"
+	"github.com/xenhim/open-ethereum-pool/payouts"
+	"github.com/xenhim/open-ethereum-pool/policy"
+	"github.com/xenhim/open-ethereum-pool/storage"
 )
 
 type Config struct {
