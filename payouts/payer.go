@@ -1,152 +1,305 @@
 package payouts
 
 import (
+	"fmt"
+	"log"
 	"math/big"
 	"os"
-	"testing"
+	"strconv"
+	"time"
 
-	"github.com/xenhim/open-ethereum-pool/rpc"
-	"github.com/xenhim/open-ethereum-pool/storage"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+
+	"github.com/sammy007/open-ethereum-pool/rpc"
+	"github.com/sammy007/open-ethereum-pool/storage"
+	"github.com/sammy007/open-ethereum-pool/util"
 )
 
-func TestMain(m *testing.M) {
-	os.Exit(m.Run())
+const txCheckInterval = 5 * time.Second
+
+type PayoutsConfig struct {
+	Enabled      bool   `json:"enabled"`
+	RequirePeers int64  `json:"requirePeers"`
+	Interval     string `json:"interval"`
+	Daemon       string `json:"daemon"`
+	Timeout      string `json:"timeout"`
+	Address      string `json:"address"`
+	Gas          string `json:"gas"`
+	GasPrice     string `json:"gasPrice"`
+	AutoGas      bool   `json:"autoGas"`
+	// In Shannon
+	Threshold int64 `json:"threshold"`
+	BgSave    bool  `json:"bgsave"`
 }
 
-func TestCalculateRewards(t *testing.T) {
-	blockReward, _ := new(big.Rat).SetString("5000000000000000000")
-	shares := map[string]int64{"0x0": 1000000, "0x1": 20000, "0x2": 5000, "0x3": 10, "0x4": 1}
-	expectedRewards := map[string]int64{"0x0": 4877996431, "0x1": 97559929, "0x2": 24389982, "0x3": 48780, "0x4": 4878}
-	totalShares := int64(1025011)
+func (self PayoutsConfig) GasHex() string {
+	x := util.String2Big(self.Gas)
+	return hexutil.EncodeBig(x)
+}
 
-	rewards := calculateRewardsForShares(shares, totalShares, blockReward)
-	expectedTotalAmount := int64(5000000000)
+func (self PayoutsConfig) GasPriceHex() string {
+	x := util.String2Big(self.GasPrice)
+	return hexutil.EncodeBig(x)
+}
 
-	totalAmount := int64(0)
-	for login, amount := range rewards {
-		totalAmount += amount
+type PayoutsProcessor struct {
+	config   *PayoutsConfig
+	backend  *storage.RedisClient
+	rpc      *rpc.RPCClient
+	halt     bool
+	lastFail error
+}
 
-		if expectedRewards[login] != amount {
-			t.Errorf("Amount for %v must be equal to %v vs %v", login, expectedRewards[login], amount)
+func NewPayoutsProcessor(cfg *PayoutsConfig, backend *storage.RedisClient) *PayoutsProcessor {
+	u := &PayoutsProcessor{config: cfg, backend: backend}
+	u.rpc = rpc.NewRPCClient("PayoutsProcessor", cfg.Daemon, cfg.Timeout)
+	return u
+}
+
+func (u *PayoutsProcessor) Start() {
+	log.Println("Starting payouts")
+
+	if u.mustResolvePayout() {
+		log.Println("Running with env RESOLVE_PAYOUT=1, now trying to resolve locked payouts")
+		u.resolvePayouts()
+		log.Println("Now you have to restart payouts module with RESOLVE_PAYOUT=0 for normal run")
+		return
+	}
+
+	intv := util.MustParseDuration(u.config.Interval)
+	timer := time.NewTimer(intv)
+	log.Printf("Set payouts interval to %v", intv)
+
+	payments := u.backend.GetPendingPayments()
+	if len(payments) > 0 {
+		log.Printf("Previous payout failed, you have to resolve it. List of failed payments:\n %v",
+			formatPendingPayments(payments))
+		return
+	}
+
+	locked, err := u.backend.IsPayoutsLocked()
+	if err != nil {
+		log.Println("Unable to start payouts:", err)
+		return
+	}
+	if locked {
+		log.Println("Unable to start payouts because they are locked")
+		return
+	}
+
+	// Immediately process payouts after start
+	u.process()
+	timer.Reset(intv)
+
+	go func() {
+		for {
+			select {
+			case <-timer.C:
+				u.process()
+				timer.Reset(intv)
+			}
+		}
+	}()
+}
+
+func (u *PayoutsProcessor) process() {
+	if u.halt {
+		log.Println("Payments suspended due to last critical error:", u.lastFail)
+		return
+	}
+	mustPay := 0
+	minersPaid := 0
+	totalAmount := big.NewInt(0)
+	payees, err := u.backend.GetPayees()
+	if err != nil {
+		log.Println("Error while retrieving payees from backend:", err)
+		return
+	}
+
+	for _, login := range payees {
+		amount, _ := u.backend.GetBalance(login)
+		amountInShannon := big.NewInt(amount)
+
+		// Shannon^2 = Wei
+		amountInWei := new(big.Int).Mul(amountInShannon, util.Shannon)
+
+		if !u.reachedThreshold(amountInShannon) {
+			continue
+		}
+		mustPay++
+
+		// Require active peers before processing
+		if !u.checkPeers() {
+			break
+		}
+		// Require unlocked account
+		if !u.isUnlockedAccount() {
+			break
+		}
+
+		// Check if we have enough funds
+		poolBalance, err := u.rpc.GetBalance(u.config.Address)
+		if err != nil {
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+		if poolBalance.Cmp(amountInWei) < 0 {
+			err := fmt.Errorf("Not enough balance for payment, need %s Wei, pool has %s Wei",
+				amountInWei.String(), poolBalance.String())
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+
+		// Lock payments for current payout
+		err = u.backend.LockPayouts(login, amount)
+		if err != nil {
+			log.Printf("Failed to lock payment for %s: %v", login, err)
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+		log.Printf("Locked payment for %s, %v Shannon", login, amount)
+
+		// Debit miner's balance and update stats
+		err = u.backend.UpdateBalance(login, amount)
+		if err != nil {
+			log.Printf("Failed to update balance for %s, %v Shannon: %v", login, amount, err)
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+
+		value := hexutil.EncodeBig(amountInWei)
+		txHash, err := u.rpc.SendTransaction(u.config.Address, login, u.config.GasHex(), u.config.GasPriceHex(), value, u.config.AutoGas)
+		if err != nil {
+			log.Printf("Failed to send payment to %s, %v Shannon: %v. Check outgoing tx for %s in block explorer and docs/PAYOUTS.md",
+				login, amount, err, login)
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+
+		// Log transaction hash
+		err = u.backend.WritePayment(login, txHash, amount)
+		if err != nil {
+			log.Printf("Failed to log payment data for %s, %v Shannon, tx: %s: %v", login, amount, txHash, err)
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+
+		minersPaid++
+		totalAmount.Add(totalAmount, big.NewInt(amount))
+		log.Printf("Paid %v Shannon to %v, TxHash: %v", amount, login, txHash)
+
+		// Wait for TX confirmation before further payouts
+		for {
+			log.Printf("Waiting for tx confirmation: %v", txHash)
+			time.Sleep(txCheckInterval)
+			receipt, err := u.rpc.GetTxReceipt(txHash)
+			if err != nil {
+				log.Printf("Failed to get tx receipt for %v: %v", txHash, err)
+				continue
+			}
+			// Tx has been mined
+			if receipt != nil && receipt.Confirmed() {
+				if receipt.Successful() {
+					log.Printf("Payout tx successful for %s: %s", login, txHash)
+				} else {
+					log.Printf("Payout tx failed for %s: %s. Address contract throws on incoming tx.", login, txHash)
+				}
+				break
+			}
 		}
 	}
-	if totalAmount != expectedTotalAmount {
-		t.Errorf("Total reward must be equal to block reward in Shannon: %v vs %v", expectedTotalAmount, totalAmount)
+
+	if mustPay > 0 {
+		log.Printf("Paid total %v Shannon to %v of %v payees", totalAmount, minersPaid, mustPay)
+	} else {
+		log.Println("No payees that have reached payout threshold")
+	}
+
+	// Save redis state to disk
+	if minersPaid > 0 && u.config.BgSave {
+		u.bgSave()
 	}
 }
 
-func TestChargeFee(t *testing.T) {
-	orig, _ := new(big.Rat).SetString("5000000000000000000")
-	value, _ := new(big.Rat).SetString("5000000000000000000")
-	expectedNewValue, _ := new(big.Rat).SetString("3750000000000000000")
-	expectedFee, _ := new(big.Rat).SetString("1250000000000000000")
-	newValue, fee := chargeFee(orig, 25.0)
-
-	if orig.Cmp(value) != 0 {
-		t.Error("Must not change original value")
+func (self PayoutsProcessor) isUnlockedAccount() bool {
+	_, err := self.rpc.Sign(self.config.Address, "0x0")
+	if err != nil {
+		log.Println("Unable to process payouts:", err)
+		return false
 	}
-	if newValue.Cmp(expectedNewValue) != 0 {
-		t.Error("Must charge and deduct correct fee")
-	}
-	if fee.Cmp(expectedFee) != 0 {
-		t.Error("Must charge fee")
-	}
+	return true
 }
 
-func TestWeiToShannonInt64(t *testing.T) {
-	wei, _ := new(big.Rat).SetString("1000000000000000000")
-	origWei, _ := new(big.Rat).SetString("1000000000000000000")
-	shannon := int64(1000000000)
-
-	if weiToShannonInt64(wei) != shannon {
-		t.Error("Must convert to Shannon")
+func (self PayoutsProcessor) checkPeers() bool {
+	n, err := self.rpc.GetPeerCount()
+	if err != nil {
+		log.Println("Unable to start payouts, failed to retrieve number of peers from node:", err)
+		return false
 	}
-	if wei.Cmp(origWei) != 0 {
-		t.Error("Must charge original value")
+	if n < self.config.RequirePeers {
+		log.Println("Unable to start payouts, number of peers on a node is less than required", self.config.RequirePeers)
+		return false
 	}
+	return true
 }
 
-func TestGetUncleReward(t *testing.T) {
-	rewards := make(map[int64]string)
-	expectedRewards := map[int64]string{
-		1: "4375000000000000000",
-		2: "3750000000000000000",
-		3: "3125000000000000000",
-		4: "2500000000000000000",
-		5: "1875000000000000000",
-		6: "1250000000000000000",
-		7: "625000000000000000",
+func (self PayoutsProcessor) reachedThreshold(amount *big.Int) bool {
+	return big.NewInt(self.config.Threshold).Cmp(amount) < 0
+}
+
+func formatPendingPayments(list []*storage.PendingPayment) string {
+	var s string
+	for _, v := range list {
+		s += fmt.Sprintf("\tAddress: %s, Amount: %v Shannon, %v\n", v.Address, v.Amount, time.Unix(v.Timestamp, 0))
 	}
-	for i := int64(1); i < 8; i++ {
-		rewards[i] = getUncleReward(1, i+1).String()
+	return s
+}
+
+func (self PayoutsProcessor) bgSave() {
+	result, err := self.backend.BgSave()
+	if err != nil {
+		log.Println("Failed to perform BGSAVE on backend:", err)
+		return
 	}
-	for i, reward := range rewards {
-		if expectedRewards[i] != rewards[i] {
-			t.Errorf("Incorrect uncle reward for %v, expected %v vs %v", i, expectedRewards[i], reward)
+	log.Println("Saving backend state to disk:", result)
+}
+
+func (self PayoutsProcessor) resolvePayouts() {
+	payments := self.backend.GetPendingPayments()
+
+	if len(payments) > 0 {
+		log.Printf("Will credit back following balances:\n%s", formatPendingPayments(payments))
+
+		for _, v := range payments {
+			err := self.backend.RollbackBalance(v.Address, v.Amount)
+			if err != nil {
+				log.Printf("Failed to credit %v Shannon back to %s, error is: %v", v.Amount, v.Address, err)
+				return
+			}
+			log.Printf("Credited %v Shannon back to %s", v.Amount, v.Address)
 		}
-	}
-}
-
-func TestGetByzantiumUncleReward(t *testing.T) {
-	rewards := make(map[int64]string)
-	expectedRewards := map[int64]string{
-		1: "2625000000000000000",
-		2: "2250000000000000000",
-		3: "1875000000000000000",
-		4: "1500000000000000000",
-		5: "1125000000000000000",
-		6: "750000000000000000",
-		7: "375000000000000000",
-	}
-	for i := int64(1); i < 8; i++ {
-		rewards[i] = getUncleReward(byzantiumHardForkHeight, byzantiumHardForkHeight+i).String()
-	}
-	for i, reward := range rewards {
-		if expectedRewards[i] != rewards[i] {
-			t.Errorf("Incorrect uncle reward for %v, expected %v vs %v", i, expectedRewards[i], reward)
+		err := self.backend.UnlockPayouts()
+		if err != nil {
+			log.Println("Failed to unlock payouts:", err)
+			return
 		}
+	} else {
+		log.Println("No pending payments to resolve")
 	}
+
+	if self.config.BgSave {
+		self.bgSave()
+	}
+	log.Println("Payouts unlocked")
 }
 
-func TestGetRewardForUngle(t *testing.T) {
-	reward := getRewardForUncle(1).String()
-	expectedReward := "156250000000000000"
-	if expectedReward != reward {
-		t.Errorf("Incorrect uncle bonus for height %v, expected %v vs %v", 1, expectedReward, reward)
-	}
-}
-
-func TestGetByzantiumRewardForUngle(t *testing.T) {
-	reward := getRewardForUncle(byzantiumHardForkHeight).String()
-	expectedReward := "93750000000000000"
-	if expectedReward != reward {
-		t.Errorf("Incorrect uncle bonus for height %v, expected %v vs %v", byzantiumHardForkHeight, expectedReward, reward)
-	}
-}
-
-
-func TestMatchCandidate(t *testing.T) {
-	gethBlock := &rpc.GetBlockReply{Hash: "0x12345A", Nonce: "0x1A"}
-	parityBlock := &rpc.GetBlockReply{Hash: "0x12345A", SealFields: []string{"0x0A", "0x1A"}}
-	candidate := &storage.BlockData{Nonce: "0x1a"}
-	orphan := &storage.BlockData{Nonce: "0x1abc"}
-
-	if !matchCandidate(gethBlock, candidate) {
-		t.Error("Must match with nonce")
-	}
-	if !matchCandidate(parityBlock, candidate) {
-		t.Error("Must match with seal fields")
-	}
-	if matchCandidate(gethBlock, orphan) {
-		t.Error("Must not match with orphan with nonce")
-	}
-	if matchCandidate(parityBlock, orphan) {
-		t.Error("Must not match orphan with seal fields")
-	}
-
-	block := &rpc.GetBlockReply{Hash: "0x12345A"}
-	immature := &storage.BlockData{Hash: "0x12345a", Nonce: "0x0"}
-	if !matchCandidate(block, immature) {
-		t.Error("Must match with hash")
-	}
+func (self PayoutsProcessor) mustResolvePayout() bool {
+	v, _ := strconv.ParseBool(os.Getenv("RESOLVE_PAYOUT"))
+	return v
 }
