@@ -507,7 +507,7 @@ func calculateRewardsForShares(shares map[string]int64, total int64, reward *big
 	percents := make(map[string]*big.Rat)
 	
 	for login, n := range shares {
-		percents[login] := big.NewRat(n, total)
+		percents[login] = big.NewRat(n, total)
 		workerReward := new(big.Rat).Mul(reward, percents[login])
 		rewards[login] += weiToShannonInt64(workerReward)
 	}
