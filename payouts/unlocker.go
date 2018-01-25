@@ -337,7 +337,7 @@ func (u *BlockUnlocker) unlockPendingBlocks() {
 		entries := []string{logEntry}
 		for login, reward := range roundRewards {
 			entries = append(entries, fmt.Sprintf("\tREWARD %v: %v: %v Shannon", block.RoundKey(), login, reward))
-			+
+			
 			per := new(big.Rat)
                         if val, ok := percents[login]; ok {
                                 per = val
