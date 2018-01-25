@@ -114,7 +114,10 @@ func (u *BlockUnlocker) unlockCandidates(candidates []*storage.BlockData) (*Unlo
 		 * Also we are searching for a block that can include this one as uncle.
 		 */
 		for i := int64(minDepth * -1); i < minDepth; i++ {
-			height := candidate.Height + i
+			height := candidate.Height + i	
+			if height < 0 {
+				continue
+			}
 			block, err := u.rpc.GetBlockByHeight(height)
 			if err != nil {
 				log.Printf("Error while retrieving block %v from node: %v", height, err)
